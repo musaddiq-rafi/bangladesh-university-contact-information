@@ -11,9 +11,9 @@ OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = "openrouter/auto"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-DDG_SEARCH_DELAY = 1.5
+DDG_SEARCH_DELAY = 2.5
 DDG_BATCH_SIZE = 5
-DDG_BATCH_PAUSE = 5.0
+DDG_BATCH_PAUSE = 8.0
 
 FETCH_TIMEOUT = 15
 FETCH_WORKERS = 5

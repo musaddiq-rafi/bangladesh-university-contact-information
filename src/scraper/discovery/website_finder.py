@@ -1,20 +1,31 @@
-"""Phase 1: Discover university websites via DuckDuckGo search."""
+"""Phase 1: Discover university websites via DuckDuckGo HTML search."""
 
 import csv
 import logging
 import time
+from urllib.parse import parse_qs, unquote, urlparse
 
-from duckduckgo_search import DDGS
+import requests
+from bs4 import BeautifulSoup
 
 from scraper.config import (
     DDG_BATCH_PAUSE,
     DDG_BATCH_SIZE,
     DDG_SEARCH_DELAY,
     INPUT_CSV,
+    USER_AGENT,
     WEBSITES_CACHE,
 )
 
 logger = logging.getLogger(__name__)
+
+DDG_HTML_URL = "https://html.duckduckgo.com/html/"
+
+JUNK_DOMAINS = {
+    "bing.com", "google.com", "duckduckgo.com", "yahoo.com",
+    "facebook.com", "twitter.com", "linkedin.com", "youtube.com",
+    "instagram.com", "reddit.com", "wikipedia.org", "wikidata.org",
+}
 
 
 def load_input_csv() -> list[dict[str, str]]:
@@ -49,31 +60,78 @@ def save_websites_cache(results: list[dict[str, str]]) -> None:
         writer.writerows(results)
 
 
-def _prefer_acbd(results: list[str]) -> str | None:
-    if not results:
-        return None
-    acbd = [u for u in results if ".ac.bd" in u]
-    if acbd:
-        return acbd[0]
-    edu = [u for u in results if ".edu" in u or ".edu.bd" in u]
-    if edu:
-        return edu[0]
-    return results[0] if results else None
-
-
-def _search_university(ddgs: DDGS, name: str, acronym: str) -> str | None:
-    query = f"{name} {acronym} official website Bangladesh"
+def _is_junk_url(url: str) -> bool:
     try:
-        results = ddgs.text(query, max_results=5)
-        urls = [r["href"] for r in results if "href" in r]
-        return _prefer_acbd(urls)
-    except Exception as e:
-        logger.warning("Search failed for %s: %s", name, e)
+        domain = urlparse(url).netloc.lower()
+        for junk in JUNK_DOMAINS:
+            if domain == junk or domain.endswith("." + junk):
+                return True
+    except Exception:
+        return True
+    return False
+
+
+def _resolve_ddg_url(href: str) -> str | None:
+    """Resolve DuckDuckGo redirect URL to actual URL."""
+    if not href:
         return None
+    if "uddg=" in href:
+        try:
+            qs = parse_qs(urlparse(href).query)
+            if "uddg" in qs:
+                return unquote(qs["uddg"][0])
+        except Exception:
+            pass
+    if href.startswith("http"):
+        return href
+    return None
+
+
+def _pick_best(links: list[str]) -> str | None:
+    clean = [u for u in links if not _is_junk_url(u)]
+    if not clean:
+        return None
+    for domain in [".ac.bd", ".edu.bd", ".edu", ".gov.bd"]:
+        match = [u for u in clean if domain in u]
+        if match:
+            return match[0]
+    return clean[0]
+
+
+def _search_ddg(query: str) -> str | None:
+    """Search DuckDuckGo HTML endpoint and return best URL."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+
+    try:
+        resp = requests.post(
+            DDG_HTML_URL,
+            data={"q": query},
+            headers=headers,
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning("Search failed: %s", e)
+        return None
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    links = []
+
+    for a in soup.find_all("a", class_="result__a", href=True):
+        url = _resolve_ddg_url(a["href"])
+        if url and not _is_junk_url(url):
+            links.append(url)
+
+    return _pick_best(links)
 
 
 def discover_websites(resume: bool = True) -> list[dict[str, str]]:
-    """Phase 1: Discover websites for all universities via DuckDuckGo."""
+    """Phase 1: Discover websites for all universities."""
     universities = load_input_csv()
     cache = load_websites_cache() if resume else {}
     results: list[dict[str, str]] = []
@@ -83,44 +141,43 @@ def discover_websites(resume: bool = True) -> list[dict[str, str]]:
     searched = 0
     found = 0
 
-    logger.info("Searching DuckDuckGo for %d university websites...", total)
-    logger.info("Preferring .ac.bd domains, batch size: %d, delay: %.1fs", DDG_BATCH_SIZE, DDG_SEARCH_DELAY)
+    logger.info("Searching for %d university websites...", total)
     print()
 
-    with DDGS() as ddgs:
-        for i, uni in enumerate(universities):
-            key = f"{uni['name']}||{uni['acronym']}"
+    for i, uni in enumerate(universities):
+        key = f"{uni['name']}||{uni['acronym']}"
 
-            if resume and key in cache:
-                results.append({
-                    "name": uni["name"],
-                    "acronym": uni["acronym"],
-                    "website": cache[key],
-                })
-                cached += 1
-                logger.info("[%d/%d] %s -> %s (cached)", i + 1, total, uni["acronym"], cache[key])
-                found += 1
-                continue
-
-            url = _search_university(ddgs, uni["name"], uni["acronym"])
+        if resume and key in cache:
             results.append({
                 "name": uni["name"],
                 "acronym": uni["acronym"],
-                "website": url or "",
+                "website": cache[key],
             })
-            searched += 1
+            cached += 1
+            logger.info("[%d/%d] %s -> %s (cached)", i + 1, total, uni["acronym"], cache[key])
+            found += 1
+            continue
 
-            if url:
-                found += 1
-                logger.info("[%d/%d] %s -> %s", i + 1, total, uni["acronym"], url)
-            else:
-                logger.warning("[%d/%d] %s -> NOT FOUND", i + 1, total, uni["acronym"])
+        query = f"{uni['name']} {uni['acronym']}"
+        url = _search_ddg(query)
+        results.append({
+            "name": uni["name"],
+            "acronym": uni["acronym"],
+            "website": url or "",
+        })
+        searched += 1
 
-            if searched % DDG_BATCH_SIZE == 0 and searched > 0:
-                logger.info("Pausing %.1fs after %d searches to avoid rate limit...", DDG_BATCH_PAUSE, DDG_BATCH_SIZE)
-                time.sleep(DDG_BATCH_PAUSE)
-            else:
-                time.sleep(DDG_SEARCH_DELAY)
+        if url:
+            found += 1
+            logger.info("[%d/%d] %s -> %s", i + 1, total, uni["acronym"], url)
+        else:
+            logger.warning("[%d/%d] %s -> NOT FOUND", i + 1, total, uni["acronym"])
+
+        if searched % DDG_BATCH_SIZE == 0:
+            logger.info("Batch pause %.0fs after %d searches...", DDG_BATCH_PAUSE, DDG_BATCH_SIZE)
+            time.sleep(DDG_BATCH_PAUSE)
+        else:
+            time.sleep(DDG_SEARCH_DELAY)
 
     save_websites_cache(results)
 
