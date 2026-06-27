@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 
 from scraper.config import LLM_MAX_TEXT_CHARS
 from scraper.extraction.email_regex import classify_emails, extract_emails
@@ -78,7 +79,6 @@ def _format_mailto(mailto: list[str]) -> str:
 def _validate_email(email: str | None) -> str | None:
     if not email:
         return None
-    import re
     if re.match(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$", email):
         return email
     return None
@@ -91,6 +91,8 @@ def llm_extract_pass1(
     """Phase 3: LLM extraction from main university website."""
     record = UniversityRecord(name=uni["name"], acronym=uni["acronym"], website=page.url)
 
+    logger.info("  Scanning %s for emails via regex...", uni["acronym"])
+
     regex_emails = extract_emails(page.cleaned_text)
     classified = classify_emails(regex_emails, page.cleaned_text, page.mailto_links)
     record.registrar_email = classified["registrar_email"]
@@ -100,6 +102,11 @@ def llm_extract_pass1(
     if record.registrar_email or record.cse_dept_email:
         record.email_source = "regex_extracted"
         record.confidence = "medium"
+        logger.info("  %s regex found: reg=%s cse=%s head=%s",
+                     uni["acronym"], record.registrar_email or "-",
+                     record.cse_dept_email or "-", record.cse_dept_head_email or "-")
+
+    logger.info("  Sending %s to LLM (text: %d chars)...", uni["acronym"], min(len(page.cleaned_text), LLM_MAX_TEXT_CHARS))
 
     text_truncated = page.cleaned_text[:LLM_MAX_TEXT_CHARS]
     prompt = PASS1_PROMPT.format(
@@ -114,6 +121,7 @@ def llm_extract_pass1(
     llm_result = call_llm(prompt, system=PASS1_SYSTEM)
     if not llm_result:
         record.notes = "LLM call failed"
+        logger.warning("  %s LLM returned no result", uni["acronym"])
         return record
 
     if not record.registrar_email:
@@ -128,6 +136,11 @@ def llm_extract_pass1(
         record.email_source = llm_result.get("email_source", "not_found")
     record.confidence = llm_result.get("confidence", record.confidence)
 
+    logger.info("  %s LLM result: reg=%s cse=%s head=%s (conf=%s)",
+                uni["acronym"], record.registrar_email or "-",
+                record.cse_dept_email or "-", record.cse_dept_head_email or "-",
+                record.confidence)
+
     return record
 
 
@@ -136,6 +149,8 @@ def llm_extract_pass2(
     page: PageData,
 ) -> UniversityRecord:
     """Phase 4: LLM extraction from CSE department page (fallback)."""
+    logger.info("  Fetching CSE dept page for %s: %s", record.acronym, page.url)
+
     text_truncated = page.cleaned_text[:LLM_MAX_TEXT_CHARS]
     prompt = PASS2_PROMPT.format(
         name=record.name,
@@ -148,6 +163,7 @@ def llm_extract_pass2(
     llm_result = call_llm(prompt, system=PASS2_SYSTEM)
     if not llm_result:
         record.notes += " | Pass 2 LLM failed"
+        logger.warning("  %s Pass 2 LLM returned no result", record.acronym)
         return record
 
     new_cse_email = _validate_email(llm_result.get("cse_dept_email"))
@@ -160,5 +176,9 @@ def llm_extract_pass2(
 
     if new_cse_email or new_head_email:
         record.confidence = llm_result.get("confidence", "medium")
+
+    logger.info("  %s Pass 2 result: cse=%s head=%s",
+                record.acronym, record.cse_dept_email or "-",
+                record.cse_dept_head_email or "-")
 
     return record

@@ -36,12 +36,10 @@ def _record_to_row(rec: UniversityRecord) -> dict[str, str]:
 
 
 def export_csv(records: list[UniversityRecord]) -> str:
-    """
-    Export merged results to CSV.
-
-    Returns the path of the written file.
-    """
+    """Export merged results to CSV."""
     FINAL_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Writing %d records to %s", len(records), FINAL_OUTPUT)
 
     with open(FINAL_OUTPUT, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS)
@@ -55,7 +53,7 @@ def export_csv(records: list[UniversityRecord]) -> str:
         if r.registrar_email or r.cse_dept_email or r.cse_dept_head_email
     )
     logger.info(
-        "Export complete: %d/%d universities have contact info -> %s",
+        "Phase 5 complete: %d/%d universities have contact info -> %s",
         with_email, total, FINAL_OUTPUT,
     )
 
@@ -73,15 +71,15 @@ def _print_summary(records: list[UniversityRecord]) -> None:
         if r.registrar_email or r.cse_dept_email or r.cse_dept_head_email
     )
 
-    summary = f"""
-=== EXTRACTION SUMMARY ===
-Total universities:  {total}
-With any email:      {any_email} ({any_email/total*100:.1f}%)
-Registrar emails:    {registrar} ({registrar/total*100:.1f}%)
-CSE dept emails:     {cse} ({cse/total*100:.1f}%)
-CSE head emails:     {head} ({head/total*100:.1f}%)
-Output:              {FINAL_OUTPUT}
-==========================
-"""
-    print(summary)
-    logger.info(summary)
+    print()
+    print(f"  {'=' * 56}")
+    print(f"  EXTRACTION SUMMARY")
+    print(f"  {'=' * 56}")
+    print(f"  Total universities:   {total}")
+    print(f"  With any email:       {any_email} ({any_email/total*100:.1f}%)")
+    print(f"  Registrar emails:     {registrar} ({registrar/total*100:.1f}%)")
+    print(f"  CSE dept emails:      {cse} ({cse/total*100:.1f}%)")
+    print(f"  CSE head emails:      {head} ({head/total*100:.1f}%)")
+    print(f"  Output file:          {FINAL_OUTPUT}")
+    print(f"  {'=' * 56}")
+    print()

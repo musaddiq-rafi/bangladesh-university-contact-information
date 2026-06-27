@@ -61,18 +61,15 @@ def _save_cache(acronym: str, page: PageData) -> None:
 
 
 def _clean_html(soup: BeautifulSoup) -> str:
-    """Strip unwanted tags and return cleaned text."""
     for tag_name in STRIP_TAGS:
         for tag in soup.find_all(tag_name):
             tag.decompose()
-
     text = soup.get_text(separator="\n", strip=True)
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
 
 
 def _extract_mailto_links(soup: BeautifulSoup) -> list[str]:
-    """Extract all email addresses from mailto: links."""
     emails = []
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
@@ -84,28 +81,21 @@ def _extract_mailto_links(soup: BeautifulSoup) -> list[str]:
 
 
 def _extract_relevant_links(soup: BeautifulSoup, base_url: str) -> dict[str, str]:
-    """Extract links matching relevant keywords."""
     links: dict[str, str] = {}
     base_domain = urlparse(base_url).netloc
-
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"].strip()
         if not href or href.startswith("#") or href.startswith("javascript:"):
             continue
-
         full_url = urljoin(base_url, href)
         parsed = urlparse(full_url)
-
         if parsed.netloc and parsed.netloc != base_domain:
             continue
-
         text_lower = (a_tag.get_text() + " " + href).lower()
-
         for keyword in RELEVANT_KEYWORDS:
             if keyword in text_lower and keyword not in links:
                 links[keyword] = full_url
                 break
-
     return links
 
 
@@ -137,7 +127,6 @@ def fetch_page(url: str, acronym: str, session: requests.Session) -> PageData | 
         mailto_links=mailto_links,
         relevant_links=relevant_links,
     )
-
     _save_cache(acronym, page)
     return page
 
@@ -146,11 +135,7 @@ def fetch_all(
     websites: list[dict[str, str]],
     workers: int = 5,
 ) -> list[tuple[dict[str, str], PageData | None]]:
-    """
-    Fetch HTML for all universities with websites.
-
-    Returns list of (university_dict, PageData_or_None) tuples.
-    """
+    """Fetch HTML for all universities with websites using concurrent workers."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     session = _make_session()
@@ -162,7 +147,10 @@ def fetch_all(
     for w in skipped:
         results.append((w, None))
 
-    logger.info("Fetching %d pages (%d skipped, no URL)", len(to_fetch), len(skipped))
+    logger.info(
+        "Fetching %d pages with %d workers (%d skipped - no URL)",
+        len(to_fetch), workers, len(skipped),
+    )
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_uni = {
@@ -179,9 +167,13 @@ def fetch_all(
                 page = None
 
             results.append((uni, page))
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 10 == 0 or (i + 1) == len(to_fetch):
                 logger.info("Fetched %d/%d pages", i + 1, len(to_fetch))
 
     found = sum(1 for _, p in results if p is not None)
-    logger.info("Fetch complete: %d/%d pages retrieved", found, len(to_fetch))
+    cached_count = sum(1 for _, p in results if p is not None)
+    logger.info(
+        "Phase 2 complete: %d/%d pages retrieved successfully",
+        found, len(to_fetch),
+    )
     return results

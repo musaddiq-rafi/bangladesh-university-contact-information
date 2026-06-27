@@ -1,4 +1,4 @@
-"""Pipeline orchestrator — runs the full scraping pipeline (Phase 1→5)."""
+"""Pipeline orchestrator - runs the full scraping pipeline (Phase 1->5)."""
 
 import csv
 import json
@@ -22,19 +22,21 @@ from scraper.models import UniversityRecord, PageData
 logger = logging.getLogger(__name__)
 
 
+def _phase_header(phase: int, title: str, description: str) -> None:
+    print()
+    print(f"  {'=' * 56}")
+    print(f"  PHASE {phase}: {title}")
+    print(f"  {description}")
+    print(f"  {'=' * 56}")
+    print()
+
+
 def run(
     step: int | None = None,
     resume: bool = True,
     api_key: str | None = None,
 ) -> None:
-    """
-    Run the full pipeline or a specific step.
-
-    Args:
-        step: If set, run only this phase (1-5). None = run all.
-        resume: Use cached results where available.
-        api_key: Override for OPENROUTER_API_KEY.
-    """
+    """Run the full pipeline or a specific step."""
     if api_key:
         import scraper.config as cfg
         cfg.OPENROUTER_API_KEY = api_key
@@ -56,9 +58,7 @@ def run(
 
 
 def _run_phase1(resume: bool) -> None:
-    logger.info("=" * 60)
-    logger.info("PHASE 1: Website Discovery")
-    logger.info("=" * 60)
+    _phase_header(1, "Website Discovery", "Searching DuckDuckGo for university websites")
     discover_websites(resume=resume)
 
 
@@ -75,9 +75,7 @@ def _load_websites() -> list[dict[str, str]]:
 
 
 def _run_phase2() -> None:
-    logger.info("=" * 60)
-    logger.info("PHASE 2: HTML Fetch")
-    logger.info("=" * 60)
+    _phase_header(2, "HTML Fetch", "Downloading and parsing university web pages")
     websites = _load_websites()
     if not websites:
         return
@@ -85,9 +83,7 @@ def _run_phase2() -> None:
 
 
 def _run_phase3() -> None:
-    logger.info("=" * 60)
-    logger.info("PHASE 3: LLM Extraction Pass 1 (Main Website)")
-    logger.info("=" * 60)
+    _phase_header(3, "LLM Extraction - Pass 1", "Extracting emails from main university websites")
     websites = _load_websites()
     if not websites:
         return
@@ -103,10 +99,11 @@ def _run_phase3() -> None:
     for uni in cached:
         results.append(_dict_to_record(uni))
 
-    logger.info(
-        "Processing %d new universities (%d cached)",
-        len(to_process), len(cached),
-    )
+    if cached:
+        logger.info("Loaded %d cached results, processing %d new universities",
+                     len(cached), len(to_process))
+    else:
+        logger.info("No cache found, processing all %d universities", len(to_process))
 
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as executor:
         futures = {}
@@ -127,17 +124,20 @@ def _run_phase3() -> None:
                 record = UniversityRecord(name=uni["name"], acronym=uni["acronym"], notes=f"Error: {e}")
 
             results.append(record)
-            if (i + 1) % 10 == 0:
-                logger.info("Processed %d/%d LLM calls", i + 1, len(to_process))
+            if (i + 1) % 10 == 0 or (i + 1) == len(to_process):
+                logger.info("LLM progress: %d/%d universities processed", i + 1, len(to_process))
 
     _save_json_cache(PASS1_CACHE, [_record_to_dict(r) for r in results])
-    logger.info("Phase 3 complete: %d records saved", len(results))
+
+    emails_found = sum(1 for r in results if r.registrar_email or r.cse_dept_email)
+    logger.info(
+        "Phase 3 complete: %d/%d universities have contact info",
+        emails_found, len(results),
+    )
 
 
 def _run_phase4() -> None:
-    logger.info("=" * 60)
-    logger.info("PHASE 4: LLM Extraction Pass 2 (CSE Department Page)")
-    logger.info("=" * 60)
+    _phase_header(4, "LLM Extraction - Pass 2", "Extracting emails from CSE department pages")
 
     pass1_records = _load_json_cache(PASS1_CACHE)
     if not pass1_records:
@@ -159,10 +159,13 @@ def _run_phase4() -> None:
         and r["acronym"] not in pass2_acronyms
     ]
 
-    logger.info(
-        "Processing %d CSE dept pages (%d cached)",
-        len(to_process), len(pass2_cached),
-    )
+    if not to_process:
+        logger.info("No CSE department pages to process")
+    else:
+        logger.info(
+            "Found %d universities with CSE dept URLs (%d cached)",
+            len(to_process), len(pass2_cached),
+        )
 
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as executor:
         futures = {}
@@ -183,35 +186,45 @@ def _run_phase4() -> None:
                 updated = record
 
             results.append(updated)
-            if (i + 1) % 5 == 0:
-                logger.info("Pass 2 processed %d/%d", i + 1, len(to_process))
+            if (i + 1) % 5 == 0 or (i + 1) == len(to_process):
+                logger.info("Pass 2 progress: %d/%d CSE pages processed", i + 1, len(to_process))
 
     _save_json_cache(PASS2_CACHE, [_record_to_dict(r) for r in results])
-    logger.info("Phase 4 complete: %d records saved", len(results))
+
+    new_emails = sum(1 for r in results if r.cse_dept_email or r.cse_dept_head_email)
+    logger.info(
+        "Phase 4 complete: %d/%d universities now have CSE dept emails",
+        new_emails, len(results),
+    )
 
 
 def _run_phase5() -> None:
-    logger.info("=" * 60)
-    logger.info("PHASE 5: Merge & Export CSV")
-    logger.info("=" * 60)
+    _phase_header(5, "Export CSV", "Merging results and writing final output")
 
     pass1 = {r["acronym"]: r for r in _load_json_cache(PASS1_CACHE)}
     pass2 = {r["acronym"]: r for r in _load_json_cache(PASS2_CACHE)}
+
+    logger.info("Loaded %d pass 1 results, %d pass 2 results", len(pass1), len(pass2))
 
     merged: dict[str, dict] = {}
 
     for acronym, rec in pass1.items():
         merged[acronym] = dict(rec)
 
+    upgraded = 0
     for acronym, rec in pass2.items():
         if acronym in merged:
             for field in ["cse_dept_email", "cse_dept_head_email"]:
                 if rec.get(field) and not merged[acronym].get(field):
                     merged[acronym][field] = rec[field]
+                    upgraded += 1
             if rec.get("confidence", "low") != "low":
                 merged[acronym]["confidence"] = rec["confidence"]
         else:
             merged[acronym] = dict(rec)
+
+    if upgraded:
+        logger.info("Pass 2 upgraded %d email fields", upgraded)
 
     records = [_dict_to_record(r) for r in merged.values()]
     records.sort(key=lambda r: r.name)
