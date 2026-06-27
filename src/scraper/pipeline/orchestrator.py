@@ -58,7 +58,7 @@ def run(
 
 
 def _run_phase1(resume: bool) -> None:
-    _phase_header(1, "Website Discovery", "Searching DuckDuckGo for university websites")
+    _phase_header(1, "Website Discovery", "Loading websites from verified UGC data")
     discover_websites(resume=resume)
 
 
@@ -75,7 +75,7 @@ def _load_websites() -> list[dict[str, str]]:
 
 
 def _run_phase2() -> None:
-    _phase_header(2, "HTML Fetch", "Downloading and parsing university web pages")
+    _phase_header(2, "HTML Fetch", "Downloading main + contact/about pages per university")
     websites = _load_websites()
     if not websites:
         return
@@ -83,7 +83,8 @@ def _run_phase2() -> None:
 
 
 def _run_phase3() -> None:
-    _phase_header(3, "LLM Extraction - Pass 1", "Extracting emails from main university websites")
+    _phase_header(3, "LLM Extraction - Pass 1", "Extracting emails from university websites")
+
     websites = _load_websites()
     if not websites:
         return
@@ -105,6 +106,9 @@ def _run_phase3() -> None:
     else:
         logger.info("No cache found, processing all %d universities", len(to_process))
 
+    success_count = 0
+    fail_count = 0
+
     with ThreadPoolExecutor(max_workers=LLM_WORKERS) as executor:
         futures = {}
         for uni in to_process:
@@ -114,25 +118,29 @@ def _run_phase3() -> None:
             else:
                 record = UniversityRecord(name=uni["name"], acronym=uni["acronym"], notes="Fetch failed")
                 results.append(record)
+                fail_count += 1
 
         for i, future in enumerate(as_completed(futures)):
             uni = futures[future]
             try:
                 record = future.result()
+                if record.registrar_email or record.cse_dept_email:
+                    success_count += 1
             except Exception as e:
                 logger.error("LLM extraction failed for %s: %s", uni["acronym"], e)
                 record = UniversityRecord(name=uni["name"], acronym=uni["acronym"], notes=f"Error: {e}")
 
             results.append(record)
-            if (i + 1) % 10 == 0 or (i + 1) == len(to_process):
-                logger.info("LLM progress: %d/%d universities processed", i + 1, len(to_process))
+            if (i + 1) % 10 == 0 or (i + 1) == len(futures):
+                logger.info("LLM progress: %d/%d (found: %d, failed: %d)",
+                           i + 1, len(futures), success_count, fail_count)
 
     _save_json_cache(PASS1_CACHE, [_record_to_dict(r) for r in results])
 
-    emails_found = sum(1 for r in results if r.registrar_email or r.cse_dept_email)
+    total_found = sum(1 for r in results if r.registrar_email or r.cse_dept_email)
     logger.info(
         "Phase 3 complete: %d/%d universities have contact info",
-        emails_found, len(results),
+        total_found, len(results),
     )
 
 
@@ -201,27 +209,30 @@ def _run_phase4() -> None:
 def _run_phase5() -> None:
     _phase_header(5, "Export CSV", "Merging results and writing final output")
 
-    pass1 = {r["acronym"]: r for r in _load_json_cache(PASS1_CACHE)}
-    pass2 = {r["acronym"]: r for r in _load_json_cache(PASS2_CACHE)}
+    pass1_list = _load_json_cache(PASS1_CACHE)
+    pass2_list = _load_json_cache(PASS2_CACHE)
 
-    logger.info("Loaded %d pass 1 results, %d pass 2 results", len(pass1), len(pass2))
+    logger.info("Loaded %d pass 1 results, %d pass 2 results", len(pass1_list), len(pass2_list))
 
-    merged: dict[str, dict] = {}
+    pass1 = {(r["name"], r["acronym"]): r for r in pass1_list}
+    pass2 = {(r["name"], r["acronym"]): r for r in pass2_list}
 
-    for acronym, rec in pass1.items():
-        merged[acronym] = dict(rec)
+    merged: dict[tuple[str, str], dict] = {}
+
+    for key, rec in pass1.items():
+        merged[key] = dict(rec)
 
     upgraded = 0
-    for acronym, rec in pass2.items():
-        if acronym in merged:
+    for key, rec in pass2.items():
+        if key in merged:
             for field in ["cse_dept_email", "cse_dept_head_email"]:
-                if rec.get(field) and not merged[acronym].get(field):
-                    merged[acronym][field] = rec[field]
+                if rec.get(field) and not merged[key].get(field):
+                    merged[key][field] = rec[field]
                     upgraded += 1
             if rec.get("confidence", "low") != "low":
-                merged[acronym]["confidence"] = rec["confidence"]
+                merged[key]["confidence"] = rec["confidence"]
         else:
-            merged[acronym] = dict(rec)
+            merged[key] = dict(rec)
 
     if upgraded:
         logger.info("Pass 2 upgraded %d email fields", upgraded)

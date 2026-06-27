@@ -1,36 +1,48 @@
 # BD University Contact Info Scraper
 
-Scrape contact information (registrar email, CSE department email, CSE department head email) from ~161 Bangladeshi university websites using Python, BeautifulSoup, DuckDuckGo search, and OpenRouter LLM.
+Scrape contact information (registrar email, CSE department email, CSE department head email) from ~161 Bangladeshi university websites using Python, BeautifulSoup, and OpenRouter LLM.
 
-## Pipeline Flow
+University websites are pre-verified from the **University Grants Commission (UGC)** of Bangladesh official list.
+
+## Pipeline
 
 ```mermaid
 flowchart TD
-    A["university_of_bangladesh.csv\n161 universities"] --> B["Phase 1: Website Discovery\nDuckDuckGo Search"]
-    B --> C["websites_cache.csv"]
-    C --> D["Phase 2: HTML Fetch\nrequests + BeautifulSoup"]
-    D --> E["html_cache/*.json\nCleaned text + links"]
-    E --> F["Phase 3: Regex Email Scan\nPre-extraction"]
-    F --> G["Phase 4: LLM Pass 1\nopenrouter/auto - Main website"]
-    G --> H{"Found CSE\ndept email?"}
-    H -->|Yes| J["Phase 5: Export CSV"]
-    H -->|No + has URL| I["Phase 4b: LLM Pass 2\nopenrouter/auto - CSE dept page"]
-    I --> J
-    H -->|No + no URL| J
-    J --> K["output/universities_contact.csv"]
+    A["data/university_of_bangladesh.csv\n161 universities\nwith verified websites"] --> B["Phase 1: Load Websites\nRead from CSV (no search needed)"]
+    B --> C["Phase 2: HTML Fetch\nrequests + BeautifulSoup"]
+    C --> D["html_cache/*.json\nCleaned text + links"]
+    D --> E["Phase 3: Regex Email Scan\nPre-extraction"]
+    E --> F["Phase 4: LLM Pass 1\nopenrouter/auto - Main website"]
+    F --> G{"Found CSE\ndept email?"}
+    G -->|Yes| H["Phase 5: Export CSV"]
+    G -->|No + has CSE URL| I["Phase 4b: LLM Pass 2\nopenrouter/auto - CSE dept page"]
+    I --> H
+    G -->|No + no CSE URL| H
+    H --> J["output/universities_contact.csv"]
 ```
 
-## Package Structure
+## Project Structure
 
-```mermaid
-graph TD
-    scraper["src/scraper/"] --> config["config.py\nSettings + env vars"]
-    scraper --> models["models.py\nUniversityRecord, PageData"]
-    scraper --> discovery["discovery/\nwebsite_finder.py"]
-    scraper --> fetcher["fetcher/\nhtml_fetcher.py"]
-    scraper --> extraction["extraction/\nemail_regex.py\nllm_client.py\nllm_extractor.py"]
-    scraper --> pipeline["pipeline/\norchestrator.py"]
-    scraper --> export["export/\ncsv_exporter.py"]
+```
+D:\Development\bd_uni_contact_info\
+├── pyproject.toml
+├── requirements.txt
+├── .env
+├── data/
+│   └── university_of_bangladesh.csv    # Input with verified websites
+├── src/scraper/
+│   ├── config.py                       # Settings + env vars
+│   ├── models.py                       # UniversityRecord, PageData
+│   ├── discovery/website_finder.py     # Phase 1: Load websites from CSV
+│   ├── fetcher/html_fetcher.py         # Phase 2: HTTP fetch + parse
+│   ├── extraction/
+│   │   ├── email_regex.py             # Regex pre-extraction
+│   │   ├── llm_client.py              # OpenRouter API client
+│   │   └── llm_extractor.py           # LLM-based extraction
+│   ├── pipeline/orchestrator.py       # Pipeline runner
+│   └── export/csv_exporter.py         # Final CSV export
+├── output/                             # Generated artifacts
+└── logs/                               # scraper.log
 ```
 
 ## Prerequisites
@@ -69,7 +81,7 @@ python -m scraper
 ### Individual Steps
 
 ```bash
-python -m scraper --step 1    # discover websites
+python -m scraper --step 1    # load websites (reads from CSV)
 python -m scraper --step 2    # fetch HTML
 python -m scraper --step 3    # LLM extraction pass 1
 python -m scraper --step 4    # LLM extraction pass 2
@@ -83,6 +95,24 @@ python -m scraper --no-resume    # ignore caches, start fresh
 python -m scraper --api-key sk-or-...  # pass API key directly
 ```
 
+## Input Data
+
+The CSV at `data/university_of_bangladesh.csv` contains 161 universities with columns:
+
+| Column | Description |
+|--------|-------------|
+| University | Full university name |
+| Acronym | Short abbreviation |
+| Established | Year of establishment |
+| Location | City/district |
+| Division | Administrative division |
+| Specialization | General, Science & Technology, etc. |
+| Type | Public, Private, International |
+| Ph.D. granting | Yes/No |
+| Website | Verified website URL from UGC list |
+
+Websites are sourced from the official [UGC Bangladesh](http://www.ugc.gov.bd/) university list.
+
 ## Output Format
 
 The final CSV (`output/universities_contact.csv`) contains:
@@ -91,7 +121,7 @@ The final CSV (`output/universities_contact.csv`) contains:
 |--------|-------------|
 | University | Full university name |
 | Acronym | Short abbreviation |
-| Website | Discovered URL |
+| Website | Website URL |
 | Registrar_Email | Registrar office email |
 | CSE_Dept_Email | CSE/CS/ICT department email |
 | CSE_Dept_Head_Email | CSE department head/chair email |
@@ -101,25 +131,25 @@ The final CSV (`output/universities_contact.csv`) contains:
 
 ## Architecture Decisions
 
-- **DuckDuckGo** for URL discovery: No API key needed, reliable for `.ac.bd` domains
+- **Pre-verified websites**: URLs from UGC list, no search engine scraping needed
 - **Two-pass LLM extraction**: Pass 1 for main website, Pass 2 for CSE dept page fallback
-- **File-based caching**: JSON/CSV caches enable resumable runs without database overhead
+- **File-based caching**: JSON caches for resumable runs without database overhead
 - **`openrouter/auto`**: Lets OpenRouter pick the best free model for each request
 
 ## Estimated Runtime
 
 | Phase | Time |
 |-------|------|
-| Phase 1 (search) | 5-10 min |
-| Phase 2 (fetch) | 5-10 min |
+| Phase 1 (load CSV) | < 1 sec |
+| Phase 2 (fetch HTML) | 5-10 min |
 | Phase 3 (LLM pass 1) | 10-15 min |
 | Phase 4 (LLM pass 2) | 5 min |
-| **Total** | **25-40 min** |
+| **Total** | **~20-30 min** |
 
 ## Troubleshooting
 
-- **Rate limits (429)**: The pipeline auto-retries with exponential backoff. Use `--resume` to continue from cache.
 - **SSL errors**: Some university sites have expired certificates. These are logged and skipped.
+- **Rate limits (OpenRouter)**: Auto-retries with exponential backoff. Use `--resume` to continue from cache.
 - **Missing emails**: Not all universities publish contact emails publicly. Check the `Notes` column.
 
 ## License

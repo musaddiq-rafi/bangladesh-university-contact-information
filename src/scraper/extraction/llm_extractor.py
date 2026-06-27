@@ -11,56 +11,78 @@ from scraper.models import PageData, UniversityRecord
 
 logger = logging.getLogger(__name__)
 
-PASS1_SYSTEM = "You extract contact information from Bangladeshi university websites. Return only valid JSON."
+PASS1_SYSTEM = """You are an expert at extracting contact information from Bangladeshi university websites.
+You must find email addresses for: (1) registrar office, (2) CSE department, (3) CSE department head.
+Return ONLY valid JSON. If an email is not found, use null. Look carefully at ALL the content provided."""
 
-PASS1_PROMPT = """You are extracting contact information from a Bangladeshi university website.
+PASS1_PROMPT = """Extract contact information from this Bangladeshi university website.
 
 University: {name} ({acronym})
 Website: {url}
 
-Here is the cleaned text content from the university website:
+Website content (from main page + contact/about pages):
 ---
 {text_content}
 ---
 
-Here are mailto links found on the page:
+Email addresses found via mailto links:
 {mailto_links}
 
-Here are relevant URLs found:
+Relevant page URLs found:
 {relevant_urls}
 
-Extract the following and return ONLY valid JSON:
+TASKS:
+1. Find the REGISTRAR office email (registrar@, admission@, or similar official email)
+2. Find the CSE/CS/ICT DEPARTMENT email (cse@, cs@, info@cse.*, department.*)
+3. Find the CSE DEPARTMENT HEAD/CHAIR email (head.cse@, chairman.cse@, prof.cse@, head@cs.*)
+4. Find the URL to the CSE/CS/ICT department page
+
+Common patterns for Bangladeshi universities:
+- registrar@university.edu.bd
+- cse@university.edu.bd or cse@dept.university.edu.bd
+- head.cse@university.edu.bd or chairman@university.edu.bd
+- info@university.edu.bd (for general contact if no specific registrar email)
+
+Return ONLY this JSON:
 {{
-  "university_name": "official name of the university",
-  "registrar_email": "registrar office email address" or null,
-  "cse_dept_email": "CSE/CS/ICT department email" or null,
-  "cse_dept_head_email": "CSE department head email" or null,
-  "email_source": "found_on_main_page" | "inferred_from_links" | "not_found",
-  "cse_dept_url": "URL to CSE/CS/ICT department page" or null,
-  "confidence": "high" | "medium" | "low"
+  "registrar_email": "email or null",
+  "cse_dept_email": "email or null",
+  "cse_dept_head_email": "email or null",
+  "cse_dept_url": "URL or null",
+  "confidence": "high" or "medium" or "low"
 }}"""
 
-PASS2_SYSTEM = "You extract CSE department contact information from Bangladeshi university department pages. Return only valid JSON."
+PASS2_SYSTEM = """You are an expert at extracting CSE department contact information from Bangladeshi university department pages.
+Look for email addresses of the department and department head/chair.
+Return ONLY valid JSON."""
 
-PASS2_PROMPT = """You are extracting CSE department contact information from a Bangladeshi university page.
+PASS2_PROMPT = """Extract CSE department contact information from this page.
 
 University: {name} ({acronym})
 Page URL: {url}
-This is the CSE/CS/ICT department page of {name}.
 
-Here is the cleaned text content from the page:
+Page content:
 ---
 {text_content}
 ---
 
-Here are mailto links found on the page:
+Email addresses found on this page:
 {mailto_links}
 
-Extract ONLY the following and return valid JSON:
+Find:
+1. CSE department email (cse@, cs@, info@cse.*)
+2. CSE department HEAD/CHAIR email (head.cse@, chairman@, head@cs.*)
+
+Look for patterns like:
+- "Department of Computer Science & Engineering" followed by an email
+- Faculty member names with "Head" or "Chair" title near an email
+- Contact section with department-specific email
+
+Return ONLY this JSON:
 {{
-  "cse_dept_email": "CSE department email" or null,
-  "cse_dept_head_email": "CSE department head/chair email" or null,
-  "confidence": "high" | "medium" | "low"
+  "cse_dept_email": "email or null",
+  "cse_dept_head_email": "email or null",
+  "confidence": "high" or "medium" or "low"
 }}"""
 
 
@@ -79,6 +101,9 @@ def _format_mailto(mailto: list[str]) -> str:
 def _validate_email(email: str | None) -> str | None:
     if not email:
         return None
+    if isinstance(email, dict):
+        return None
+    email = str(email).strip()
     if re.match(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$", email):
         return email
     return None
@@ -94,7 +119,7 @@ def llm_extract_pass1(
     logger.info("  Scanning %s for emails via regex...", uni["acronym"])
 
     regex_emails = extract_emails(page.cleaned_text)
-    classified = classify_emails(regex_emails, page.cleaned_text, page.mailto_links)
+    classified = classify_emails(regex_emails, page.cleaned_text, page.mailto_links, page.url)
     record.registrar_email = classified["registrar_email"]
     record.cse_dept_email = classified["cse_dept_email"]
     record.cse_dept_head_email = classified["cse_dept_head_email"]
@@ -106,7 +131,8 @@ def llm_extract_pass1(
                      uni["acronym"], record.registrar_email or "-",
                      record.cse_dept_email or "-", record.cse_dept_head_email or "-")
 
-    logger.info("  Sending %s to LLM (text: %d chars)...", uni["acronym"], min(len(page.cleaned_text), LLM_MAX_TEXT_CHARS))
+    text_len = min(len(page.cleaned_text), LLM_MAX_TEXT_CHARS)
+    logger.info("  Sending %s to LLM (text: %d chars)...", uni["acronym"], text_len)
 
     text_truncated = page.cleaned_text[:LLM_MAX_TEXT_CHARS]
     prompt = PASS1_PROMPT.format(
@@ -149,7 +175,22 @@ def llm_extract_pass2(
     page: PageData,
 ) -> UniversityRecord:
     """Phase 4: LLM extraction from CSE department page (fallback)."""
-    logger.info("  Fetching CSE dept page for %s: %s", record.acronym, page.url)
+    logger.info("  Pass 2 for %s: %s", record.acronym, page.url)
+
+    regex_emails = extract_emails(page.cleaned_text)
+    classified = classify_emails(regex_emails, page.cleaned_text, page.mailto_links, page.url)
+
+    new_cse = classified["cse_dept_email"]
+    new_head = classified["cse_dept_head_email"]
+
+    if new_cse and not record.cse_dept_email:
+        record.cse_dept_email = new_cse
+    if new_head and not record.cse_dept_head_email:
+        record.cse_dept_head_email = new_head
+
+    if record.cse_dept_email and record.cse_dept_head_email:
+        record.confidence = "medium"
+        return record
 
     text_truncated = page.cleaned_text[:LLM_MAX_TEXT_CHARS]
     prompt = PASS2_PROMPT.format(
@@ -163,7 +204,6 @@ def llm_extract_pass2(
     llm_result = call_llm(prompt, system=PASS2_SYSTEM)
     if not llm_result:
         record.notes += " | Pass 2 LLM failed"
-        logger.warning("  %s Pass 2 LLM returned no result", record.acronym)
         return record
 
     new_cse_email = _validate_email(llm_result.get("cse_dept_email"))
@@ -176,9 +216,5 @@ def llm_extract_pass2(
 
     if new_cse_email or new_head_email:
         record.confidence = llm_result.get("confidence", "medium")
-
-    logger.info("  %s Pass 2 result: cse=%s head=%s",
-                record.acronym, record.cse_dept_email or "-",
-                record.cse_dept_head_email or "-")
 
     return record

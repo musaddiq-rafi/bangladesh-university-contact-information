@@ -11,22 +11,22 @@ OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = "openrouter/auto"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-DDG_SEARCH_DELAY = 2.5
-DDG_BATCH_SIZE = 5
-DDG_BATCH_PAUSE = 8.0
+DDG_SEARCH_DELAY = 8.0
+DDG_BATCH_SIZE = 3
+DDG_BATCH_PAUSE = 30.0
 
-FETCH_TIMEOUT = 15
-FETCH_WORKERS = 5
+FETCH_TIMEOUT = 30
+FETCH_WORKERS = 3
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-LLM_WORKERS = 3
-LLM_RATE_LIMIT = 1.0
-LLM_MAX_TEXT_CHARS = 8000
-LLM_RETRIES = 2
+LLM_WORKERS = 2
+LLM_RATE_LIMIT = 1.5
+LLM_MAX_TEXT_CHARS = 16000
+LLM_RETRIES = 3
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"

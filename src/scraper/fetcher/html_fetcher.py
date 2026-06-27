@@ -1,11 +1,16 @@
-"""Phase 2: Fetch university website HTML and extract clean text + links."""
+"""Phase 2: Fetch university website HTML with multi-page crawling and raw email extraction."""
 
 import json
 import logging
+import re
+import socket
 from urllib.parse import urljoin, urlparse
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from scraper.config import FETCH_TIMEOUT, HTML_CACHE_DIR, USER_AGENT
 from scraper.models import PageData
@@ -17,17 +22,34 @@ RELEVANT_KEYWORDS = [
     "ict", "faculty", "department", "info", "science",
 ]
 
-STRIP_TAGS = ["script", "style", "nav", "footer", "header", "aside", "noscript"]
+SUB_PAGES = ["", "/contact", "/contact-us", "/about", "/about-us", "/registrar"]
+
+EMAIL_REGEX = re.compile(
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"
+)
+
+STRIP_TAGS = ["script", "style", "noscript"]
 
 
 def _make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
+    s.verify = False
+    s.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,bn;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+    })
+    adapter = requests.adapters.HTTPAdapter(
+        max_retries=requests.adapters.Retry(total=2, backoff_factor=0.5)
+    )
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 
 def _cache_path(acronym: str) -> str:
-    safe = acronym.replace("/", "_").replace("\\", "_")
+    safe = re.sub(r'[^\w\-]', '_', acronym)
     return str(HTML_CACHE_DIR / f"{safe}.json")
 
 
@@ -60,6 +82,21 @@ def _save_cache(acronym: str, page: PageData) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def _extract_emails_from_raw_html(raw_html: str) -> list[str]:
+    """Extract all email addresses from raw HTML source."""
+    raw = EMAIL_REGEX.findall(raw_html)
+    cleaned = []
+    false_pos = {".png@", ".jpg@", ".jpeg@", ".gif@", ".svg@",
+                 ".pdf@", ".doc@", ".mp3@", ".mp4@", ".css@", ".js@"}
+    for email in raw:
+        el = email.lower()
+        if any(fp in el for fp in false_pos):
+            continue
+        if len(email) > 5 and "." in email.split("@")[1]:
+            cleaned.append(email.lower())
+    return list(set(cleaned))
+
+
 def _clean_html(soup: BeautifulSoup) -> str:
     for tag_name in STRIP_TAGS:
         for tag in soup.find_all(tag_name):
@@ -76,7 +113,7 @@ def _extract_mailto_links(soup: BeautifulSoup) -> list[str]:
         if href.lower().startswith("mailto:"):
             email = href[7:].split("?")[0].strip()
             if "@" in email:
-                emails.append(email)
+                emails.append(email.lower())
     return list(set(emails))
 
 
@@ -99,20 +136,22 @@ def _extract_relevant_links(soup: BeautifulSoup, base_url: str) -> dict[str, str
     return links
 
 
-def fetch_page(url: str, acronym: str, session: requests.Session) -> PageData | None:
-    """Fetch a single page and return structured PageData."""
-    cached = _load_cache(acronym)
-    if cached:
-        logger.debug("Cache hit for %s", acronym)
-        return cached
-
-    try:
-        resp = session.get(url, timeout=FETCH_TIMEOUT, verify=True)
-        resp.raise_for_status()
-        resp.encoding = resp.apparent_encoding or "utf-8"
-    except requests.RequestException as e:
-        logger.warning("Fetch failed for %s (%s): %s", acronym, url, e)
-        return None
+def _fetch_single_page(url: str, session: requests.Session) -> tuple[str, str, list[str], dict[str, str]] | None:
+    """Fetch a single URL and return (raw_html, cleaned_text, mailto_links, relevant_links)."""
+    for attempt_url in [url, url.replace("https://", "http://", 1)]:
+        if attempt_url != url and url.startswith("https://"):
+            logger.debug("Retrying with HTTP: %s", attempt_url)
+        try:
+            resp = session.get(attempt_url, timeout=FETCH_TIMEOUT)
+            resp.raise_for_status()
+            resp.encoding = resp.apparent_encoding or "utf-8"
+        except requests.RequestException as e:
+            if attempt_url == url:
+                logger.debug("Fetch failed %s: %s", attempt_url, e)
+                continue
+            logger.debug("Fetch failed %s: %s", attempt_url, e)
+            return None
+        break
 
     raw_html = resp.text
     soup = BeautifulSoup(raw_html, "lxml")
@@ -120,12 +159,73 @@ def fetch_page(url: str, acronym: str, session: requests.Session) -> PageData | 
     mailto_links = _extract_mailto_links(soup)
     relevant_links = _extract_relevant_links(soup, url)
 
+    return raw_html, cleaned_text, mailto_links, relevant_links
+
+
+def _domain_resolves(url: str) -> bool:
+    """Quick DNS check — skip domains that don't resolve at all."""
+    host = urlparse(url).hostname
+    if not host:
+        return False
+    try:
+        socket.getaddrinfo(host, 80, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_ADDRCONFIG)
+        return True
+    except socket.gaierror:
+        return False
+
+
+def fetch_page(url: str, acronym: str, session: requests.Session) -> PageData | None:
+    """Fetch a university's main page plus contact subpages, merge results."""
+    cached = _load_cache(acronym)
+    if cached:
+        logger.debug("Cache hit for %s", acronym)
+        return cached
+
+    if not _domain_resolves(url):
+        logger.warning("Domain does not resolve for %s (%s)", acronym, urlparse(url).hostname)
+        return None
+
+    base_url = url.rstrip("/")
+    all_raw_html = ""
+    all_cleaned_text = ""
+    all_mailto = []
+    all_relevant: dict[str, str] = {}
+    emails_from_raw: list[str] = []
+
+    for sub in SUB_PAGES:
+        page_url = base_url + sub
+        result = _fetch_single_page(page_url, session)
+        if result is None:
+            continue
+
+        raw, cleaned, mailto, relinks = result
+        all_raw_html += "\n" + raw
+        all_cleaned_text += "\n" + cleaned
+        all_mailto.extend(mailto)
+        for k, v in relinks.items():
+            if k not in all_relevant:
+                all_relevant[k] = v
+
+        raw_emails = _extract_emails_from_raw_html(raw)
+        emails_from_raw.extend(raw_emails)
+
+        if sub == "":
+            primary_url = page_url
+
+    if not all_cleaned_text.strip():
+        return None
+
+    all_mailto = list(set(all_mailto))
+    emails_from_raw = list(set(emails_from_raw))
+
+    all_cleaned_text += "\n\n[RAW EMAILS FOUND]: " + " ".join(emails_from_raw) if emails_from_raw else ""
+
     page = PageData(
-        url=url,
-        raw_html=raw_html,
-        cleaned_text=cleaned_text,
-        mailto_links=mailto_links,
-        relevant_links=relevant_links,
+        url=base_url,
+        raw_html=all_raw_html,
+        cleaned_text=all_cleaned_text.strip(),
+        mailto_links=all_mailto,
+        relevant_links=all_relevant,
     )
     _save_cache(acronym, page)
     return page
@@ -171,7 +271,6 @@ def fetch_all(
                 logger.info("Fetched %d/%d pages", i + 1, len(to_fetch))
 
     found = sum(1 for _, p in results if p is not None)
-    cached_count = sum(1 for _, p in results if p is not None)
     logger.info(
         "Phase 2 complete: %d/%d pages retrieved successfully",
         found, len(to_fetch),
